@@ -1,6 +1,6 @@
 """Weapon selection and aim for Mech Royale's simulated weapons."""
 from dataclasses import dataclass
-from math import atan2, cos, dist, hypot, pi, radians, sin, sqrt
+from math import atan2, cos, dist, hypot, pi, radians, sin
 
 from arena import clamp
 
@@ -21,6 +21,8 @@ class Shot:
     vertical: float
     value: float
     slot: int
+    launch: float
+    release: bool = False
 
 
 class Combat:
@@ -29,6 +31,7 @@ class Combat:
         self.config = config
         self.tick = 1 / config["match"]["tick_hz"]
         self.interval = self.tick * config["match"]["decide_every"]
+        self.laser_lost_at = None
 
     def dimensions(self, target):
         if target.get("kind") == "mech":
@@ -59,11 +62,11 @@ class Combat:
             seconds = launch + max(0, dist(origin, point) - 3.0) / speed
         return point
 
-    def mortar(self, origin, target, height, settings):
+    def mortar(self, origin, target, height, settings, launch):
         speed, gravity = settings["speed"], settings["gravity"]
         # Find the first ballistic intercept. Later roots describe high arcs.
         def intercept(seconds):
-            point = self.target_at(target, height, self.tick + seconds, 0.42)
+            point = self.target_at(target, height, launch + seconds, 0.42)
             raised = (*point[:2], point[2] + 0.5 * gravity * seconds ** 2)
             return dist(origin, raised) - (speed * seconds + 3), raised
 
@@ -115,11 +118,14 @@ class Combat:
         stats = me["stats"]
         origin = x, y, z + stats["muzzle_height"]
         distance = dist(origin, (*target["pos"][:2], target["pos"][2] + 0.60 * height))
-        ready = weapon["cooldown"] <= self.interval + 1e-5
+        delay = max(weapon["cooldown"], weapon.get("reload", 0))
+        ready = delay <= self.interval + 1e-5
+        launch = self.interval if delay > self.tick + 1e-5 else self.tick
+        release = False
         if kind == "mortar":
             if not ready or distance > settings["speed"] ** 2 / settings["gravity"] * 1.07:
                 return None
-            result = self.mortar((x, y, z + stats["height"] + 0.5), target, height, settings)
+            result = self.mortar((x, y, z + stats["height"] + 0.5), target, height, settings, launch)
             if result is None:
                 return None
             yaw, pitch = result
@@ -133,7 +139,7 @@ class Combat:
                 return None
             for fraction in (0.60, 0.82, 0.40):
                 point = self.straight(origin, target, height, settings.get("speed", 0),
-                                      self.tick, fraction)
+                                      launch, fraction)
                 yaw, pitch = angles(origin, point)
                 if stats["min_pitch"] <= pitch <= stats["max_pitch"] and self.arena.clear(origin, point):
                     break
@@ -163,21 +169,30 @@ class Combat:
                 if fraction < 1:
                     charge_fraction = (fraction - settings["min_frac"]) / (1 - settings["min_frac"])
                     desired = clamp(settings["charge"] * charge_fraction, settings["min_charge"], desired)
-                value = (180 if charge >= desired else 85) if charge or ready else 18
+                release = charge >= desired
+                # A new or charging beam can slew onto its aim on a later
+                # update. Give the gun this update when it has a shot ready.
+                value = 180 if release else 42 if charge or ready else 12
         if not stats["min_pitch"] <= pitch <= stats["max_pitch"]:
             return None
-        return Shot((yaw, pitch), yaw_tolerance, pitch_tolerance, value, slot)
+        return Shot((yaw, pitch), yaw_tolerance, pitch_tolerance, value, slot, launch, release)
 
-    def act(self, me, target, close_pressure):
+    def act(self, me, target, close_pressure, now):
         plans = [self.solve(me, target, i)
                  for i, weapon in enumerate(me["weapons"]) if weapon] if target else []
         plans = [plan for plan in plans if plan]
-        if not plans:
-            return None, self.hold_charge(me)
         yaw, pitch = me["aim"]
         stats = me["stats"]
-        yaw_step = stats["turn_rate"] * self.tick
-        pitch_step = stats["pitch_rate"] * self.tick
+        laser_visible = any(me["weapons"][p.slot]["kind"] == "laser" for p in plans)
+        if laser_visible:
+            self.laser_lost_at = None
+        elif self.laser_lost_at is None:
+            self.laser_lost_at = now
+        fire = [bool(w and w["kind"] == "laser" and 0 < w["charge"] and
+                     (laser_visible or now - self.laser_lost_at < 0.25))
+                for w in me["weapons"]]
+        if not plans:
+            return None, fire
 
         def aim_value(candidate):
             value = candidate.value
@@ -190,12 +205,13 @@ class Combat:
             return value
 
         goal = max(plans, key=aim_value).aim
-        after_yaw = yaw + clamp(angle(goal[0] - yaw), -yaw_step, yaw_step)
-        after_pitch = pitch + clamp(goal[1] - pitch, -pitch_step, pitch_step)
-        fire = self.hold_charge(me)
         for plan in plans:
             weapon = me["weapons"][plan.slot]
-            kind, settings = weapon["kind"], weapon["stats"]
+            kind = weapon["kind"]
+            yaw_step = stats["turn_rate"] * plan.launch
+            pitch_step = stats["pitch_rate"] * plan.launch
+            after_yaw = yaw + clamp(angle(goal[0] - yaw), -yaw_step, yaw_step)
+            after_pitch = pitch + clamp(goal[1] - pitch, -pitch_step, pitch_step)
             yaw_error = abs(angle(after_yaw - plan.aim[0]))
             pitch_error = abs(after_pitch - plan.aim[1])
             aligned = yaw_error <= plan.horizontal and pitch_error <= plan.vertical
@@ -203,18 +219,13 @@ class Combat:
             if kind == "laser":
                 charge = weapon["charge"]
                 if charge:
-                    fire[plan.slot] = not (aligned and plan.value == 180)
+                    fire[plan.slot] = not (aligned and plan.release)
                 elif ready:
                     fire[plan.slot] = aligned or (
                         yaw_error < 0.27 and pitch_error < 0.20 and not close_pressure
                     )
             else:
-                fire[plan.slot] = ready and aligned
+                fire[plan.slot] = ready and aligned and (
+                    kind != "gun" or (weapon["ammo"] > 0 and weapon["reload"] <= self.interval + 1e-5)
+                )
         return goal, fire
-
-    @staticmethod
-    def hold_charge(me):
-        # Keep a nearly charged laser through brief occlusion. Before forced
-        # discharge, tap off so a stale lock cannot keep monopolizing the aim.
-        return [bool(w and w["kind"] == "laser" and 0 < w["charge"] < w["stats"]["charge"])
-                for w in me["weapons"]]

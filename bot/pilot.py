@@ -1,5 +1,6 @@
 """Choose safe motion while preserving the ability to engage or loot."""
 from math import atan2, cos, dist, hypot, pi, sin
+from time import perf_counter
 
 from arena import clamp
 
@@ -22,6 +23,8 @@ class Pilot:
         self.last_change = 0
         self.last_move = (0, 0)
         self.samples = ()
+        self.strafe_direction = 1
+        self.strafe_change = 0
 
     def zone_goal(self, obs):
         zone, me, now = obs["zone"], obs["self"], obs["t"]
@@ -68,7 +71,7 @@ class Pilot:
                 return candidate
         return goal
 
-    def cover(self, obs, enemies):
+    def cover(self, obs, enemies, deadline):
         me, now = obs["self"], obs["t"]
         if now < self.last_change and self.samples:
             return self.samples
@@ -77,24 +80,26 @@ class Pilot:
         stats, zone = me["stats"], obs["zone"]
         candidates = []
         threats = enemies[:3]
-        for ring in (17, 31):
-            for k in range(12):
+        for ring in (0, 17, 31):
+            for k in range(12 if ring else 1):
+                if perf_counter() >= deadline:
+                    break
                 a = k * pi / 6
                 point = x + ring * cos(a), y + ring * sin(a)
                 if dist(point, zone["center"]) > zone["radius"] - 4:
                     continue
                 if not self.arena.walk_segment((x, y, z), point, stats["radius"], stats["height"]):
                     continue
-                eye = (*point, self.arena.ground(*point) + stats["eye_height"] * 0.8)
+                eye = (*point, (self.arena.ground(*point) if ring else z) + stats["muzzle_height"])
                 hidden = 0
                 separation = 0
                 for target in threats:
                     enemy_pos = target["pos"]
                     gap = dist(point, xy(enemy_pos))
                     separation += min(120, gap)
-                    if gap >= 9 and not self.arena.clear((*enemy_pos[:2], enemy_pos[2] + 7), eye):
+                    if gap >= 9 and not self.arena.clear(self.firing_point(target), eye):
                         hidden += 1
-                score = 55 * hidden + separation / len(threats) - 0.4 * ring
+                score = 80 * hidden + separation / len(threats) - 0.72 * ring
                 candidates.append((score, point))
         self.samples = max(candidates, default=(0, ()))[1]
         return self.samples
@@ -122,12 +127,17 @@ class Pilot:
         x, y, z = me["pos"]
         mid = z + me["stats"]["height"] / 2
         radius = me["stats"]["radius"]
+        old_vx, old_vy = me["vel"][:2]
+        dvx, dvy = velocity[0] - old_vx, velocity[1] - old_vy
+        stats = me["stats"]
+        accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
+        settle = hypot(dvx, dvy) / accel
         penalty = 0.0
         for p in bullets:
             px, py, pz = p["pos"]
             vx, vy, vz = p["vel"]
-            rvx, rvy = vx - velocity[0], vy - velocity[1]
             dx, dy = x - px, y - py
+            rvx, rvy = vx - old_vx, vy - old_vy
             t = (dx * rvx + dy * rvy) / max(1, rvx * rvx + rvy * rvy)
             if not 0 < t < 0.64:
                 continue
@@ -140,38 +150,55 @@ class Pilot:
                 width += settings["splash_radius"]
                 weight = 47
             if abs(flight_z - mid) < me["stats"]["height"] * 0.58 + width:
-                miss = hypot(dx - rvx * t, dy - rvy * t)
+                steer = t * t / (2 * settle) if t < settle else t - settle / 2
+                miss = hypot(dx - rvx * t + dvx * steer, dy - rvy * t + dvy * steer)
                 penalty += weight * clamp(1.4 - miss / width, 0, 1)
         for enemy in lasers:
             yaw = enemy["aim"][0]
             dx, dy = x - enemy["pos"][0], y - enemy["pos"][1]
+            if dx * cos(yaw) + dy * sin(yaw) < 0:
+                continue
             cross = -dx * sin(yaw) + dy * cos(yaw)
             future = cross + (-velocity[0] * sin(yaw) + velocity[1] * cos(yaw)) * 0.3
             if abs(cross) < radius * 2.5:
                 penalty += 16 * clamp(1.3 - abs(future) / (radius + 1), 0, 1)
         return penalty
 
-    def move(self, obs, goal, urgent, enemies, target, recover, quiet):
+    def move(self, obs, goal, urgent, enemies, target, recover, quiet, deadline):
         me, zone, now = obs["self"], obs["zone"], obs["t"]
         x, y, z = me["pos"]
         stats = me["stats"]
         waypoint = self.waypoint(obs, goal) if goal is not None else None
         bullets, lasers = self.incoming(obs, enemies)
         fighting = target is not None and target.get("kind") == "mech"
-        preferred = 60
+        preferred = 142
         equipped = {w["kind"] for w in me["weapons"] if w}
         lightning = next((w for w in me["weapons"] if w and w["kind"] == "lightning"), None)
         if lightning and me["energy"] > 20 and not recover:
-            preferred = min(preferred, lightning["stats"]["range"] * 0.74)
+            preferred = lightning["stats"]["range"] * 0.84
         if "laser" in equipped:
-            preferred = 74
+            preferred = 165
+        if "mortar" in equipped:
+            preferred = 105
         spacing = dist((x, y), xy(target["pos"])) if fighting else 0
         if fighting and "mortar" in target.get("weapons", ()):
-            preferred = max(preferred, 55)
+            preferred = max(preferred, 82)
+        if fighting and "lightning" in target.get("weapons", ()):
+            preferred = max(preferred, self.config["weapons"]["lightning"]["range"] + 18)
+        if fighting and target.get("hp", 1400) < 150 and not recover:
+            preferred = min(preferred, 95)
+        if now >= self.strafe_change:
+            self.strafe_direction *= -1
+            self.strafe_change = now + 0.9 + 0.35 * sin(obs["tick"] + me["id"])
         active = fighting or bullets or lasers or len(enemies) > 1 or (quiet and recover and enemies)
         quiet = quiet and not active and not urgent
+        reloading = any(w and w["kind"] == "gun" and w["reload"] > 0.35 for w in me["weapons"])
+        secondary_ready = any(w and w["kind"] != "gun" and
+                              w["cooldown"] <= 0.35 for w in me["weapons"])
+        need_cover = recover or (fighting and reloading and not secondary_ready)
         boost = me["grounded"] and me["energy"] > (6 if urgent else 28) and (
-            urgent or (active and (recover or lasers or any(p["kind"] == "mortar" for p in bullets)))
+            urgent or (active and (recover or lasers or any(p["kind"] == "mortar" for p in bullets)
+                                   or (me["energy"] > 70 and len(enemies) >= 2 and "lightning" not in equipped)))
             or (not active and not quiet and me["energy"] > 75 and waypoint is not None and
                 dist((x, y), xy(waypoint)) > 32 and "lightning" not in equipped)
         )
@@ -186,7 +213,7 @@ class Pilot:
             variations = (99,)
         elif not active:
             variations = (0, 1, -1, 2, -2, 3, -3, 4, -4, 6, 99)
-        best = (-float("inf"), (0.0, 0.0))
+        options = []
         for offset in variations:
             if offset == 99:
                 move = (0.0, 0.0)
@@ -217,19 +244,50 @@ class Pilot:
                 if recover:
                     score += (gap - spacing) * 0.70
                 else:
-                    score += (abs(spacing - preferred) - abs(gap - preferred)) * 0.90
+                    score += (abs(spacing - preferred) - abs(gap - preferred)) * (
+                        0.75 if waypoint is None else 0.38
+                    )
                     side = sin(reference - bearing((x, y), target["pos"]) + offset * pi / 6)
                     if offset != 99:
-                        score += (1 if int(now / 1.8) % 2 else -1) * side * 2.1
+                        score += self.strafe_direction * side * 4.4
             for enemy in enemies[:4]:
                 gap = dist(look, xy(enemy["pos"]))
                 if enemy is not target or recover:
                     score -= 1.5 * max(0, 39 - gap)
-            score -= self.danger(me, velocity, bullets, lasers)
+                    if not urgent and enemy is not target:
+                        score += 0.6 * (min(110, gap) - min(110, dist((x, y), xy(enemy["pos"]))))
+            score -= self.danger(me, (vx, vy), bullets, lasers)
             score += 0.8 * (move[0] * self.last_move[0] + move[1] * self.last_move[1])
-            if score > best[0]:
-                best = score, move
-        move = best[1]
+            options.append((score, move, look))
+        options.sort(reverse=True, key=lambda option: option[0])
+        move = options[0][1]
+        if not urgent and fighting and enemies:
+            # Refine the best local moves using the firing lanes that would
+            # open or close over the next half second.
+            threats = [enemy for enemy in enemies[:3] if enemy is not target]
+            target_point = self.firing_point(target)
+            enemy_points = [self.firing_point(enemy) for enemy in threats]
+            on_ground = z <= self.arena.ground(x, y) + stats["step_up"]
+
+            def cover_score(option):
+                score, _, look = option
+                ground = self.arena.ground(*look)
+                future_z = ground if on_ground else max(z, ground)
+                muzzle = (*look, future_z + stats["muzzle_height"])
+                if self.arena.clear(target_point, muzzle):
+                    score += -5 if need_cover else 4
+                for point in enemy_points:
+                    if self.arena.clear(point, muzzle):
+                        score -= 4
+                return score
+
+            best_lane = -float("inf")
+            for option in options[:5]:
+                if perf_counter() >= deadline:
+                    break
+                score = cover_score(option)
+                if score > best_lane:
+                    best_lane, move = score, option[1]
         jump = False
         stuck = waypoint is not None and dist((x, y), xy(waypoint)) > 5 and hypot(*move) < 0.25
         if stuck and (urgent or not active) and me["energy"] > 29:
@@ -242,3 +300,8 @@ class Pilot:
             boost = True
         self.last_move = move
         return move, boost and bool(hypot(*move)), jump
+
+    def firing_point(self, enemy):
+        size = 1 + self.config["cubes"]["size_per_cube"] * enemy.get("cubes", 0)
+        x, y, z = enemy["pos"]
+        return x, y, z + size * self.config["mech"]["muzzle_height"]

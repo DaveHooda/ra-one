@@ -145,22 +145,20 @@ class Arena:
         count = max(1, ceil(hypot(dx, dy) / 3))
         # Step along the ray to avoid scanning all buckets in a diagonal box.
         nearby = set()
-        previous = None
+        ix, iy = floor(x / self.bucket), floor(y / self.bucket)
+        nearby.update(self.spatial.get((ix, iy), ()))
         for i in range(count + 1):
             t = i / count
             sx, sy = x + t * dx, y + t * dy
             if z + t * dz < self.ground(sx, sy) + 0.05:
                 return False
-            key = floor(sx / self.bucket), floor(sy / self.bucket)
-            if key != previous:
-                for bucket in self.buckets(sx - 3, sy - 3, sx + 3, sy + 3):
-                    nearby.update(self.spatial.get(bucket, ()))
-                previous = key
-            else:
-                # A neighboring bucket may contain a corner crossed by this ray.
-                for bucket in self.buckets(sx - 3, sy - 3, sx + 3, sy + 3):
-                    if bucket != key:
-                        nearby.update(self.spatial.get(bucket, ()))
+            nx, ny = floor(sx / self.bucket), floor(sy / self.bucket)
+            if (nx, ny) != (ix, iy):
+                nearby.update(self.spatial.get((nx, ny), ()))
+                if nx != ix and ny != iy:
+                    nearby.update(self.spatial.get((nx, iy), ()))
+                    nearby.update(self.spatial.get((ix, ny), ()))
+                ix, iy = nx, ny
         return not any(self.prisms[i].intersects(a, b) for i in nearby)
 
     def walkable(self, x, y, z, radius, height):

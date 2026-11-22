@@ -1,5 +1,6 @@
 """Ra-One's Mech Royale entry."""
 from math import dist, pi, sin
+from time import perf_counter
 
 from arena import Arena
 from combat import Combat, angle
@@ -8,9 +9,9 @@ from pilot import Pilot, bearing, xy
 
 
 UPGRADE_PRIORITY = {
-    "nanites": 102, "gun_mag": 90, "armor": 87, "gun_damage": 84,
-    "plating": 80, "laser_damage": 78, "mortar_reload": 75, "gun_rate": 72,
-    "gun_velocity": 69, "servos": 68, "laser_charge": 65, "lightning_range": 63,
+    "nanites": 102, "gun_mag": 94, "laser_damage": 90, "gun_damage": 88,
+    "armor": 83, "plating": 81, "mortar_reload": 75, "gun_rate": 72,
+    "gun_velocity": 78, "servos": 74, "laser_charge": 76, "lightning_range": 71,
     "mortar_velocity": 60, "gyros": 56, "lightning_efficiency": 53,
     "mortar_splash": 50, "reactor": 45, "jets": 42, "sensors": 40,
     "lightning_chain": 33, "capacitor": 31, "laser_pierce": 28,
@@ -31,6 +32,7 @@ class Bot:
         self.last_attack = None
         self.last_damage = -100
         self.recovering = False
+        self.recent_attackers = {}
         self.free_for_all = False
         self.spawn = None
 
@@ -40,6 +42,14 @@ class Bot:
         if damage:
             self.last_damage = now
         attackers = [event for event in damage if event["bearing"] is not None]
+        self.recent_attackers = {key: when for key, when in self.recent_attackers.items()
+                                 if now - when < 4}
+        for event in attackers:
+            if event["by"] is not None and event["by"] < self.config["match"]["mechs"]:
+                self.recent_attackers[event["by"]] = now
+        for event in obs["events"]:
+            if event["type"] == "kill":
+                self.recent_attackers.pop(event["target"], None)
         if attackers:
             attack = max(attackers, key=lambda event: event["amount"])
             self.last_attack = attack.get("by"), attack["bearing"], now
@@ -110,7 +120,7 @@ class Bot:
             point = item["pos"]
             distance = dist(xy(position), xy(point))
             weapon = "kind" in item
-            seek_range = 145 if weapon and needs_secondary and not enemy_count else 88
+            seek_range = 175 if weapon and needs_secondary else 88
             if distance > seek_range or dist(xy(point), zone["center"]) > safe_radius:
                 continue
             # Roof loot takes too long to reach from the street.
@@ -121,19 +131,25 @@ class Bot:
                     continue
                 score = 71 + WEAPON_PRIORITY[item["kind"]] * 8
                 if needs_secondary:
-                    score += 48 if not enemy_count else 12
+                    score += 60 if not enemy_count else 28
                 else:
                     score -= 28
             else:
-                score = 107 if me["cubes"] < self.config["cubes"]["stat_cap"] else 66
+                score = 126 if me["cubes"] < self.config["cubes"]["stat_cap"] else 66
                 nearby = sum(1 for other in obs["cubes"] if dist(xy(point), xy(other["pos"])) < 7)
                 score += min(18, nearby * 4)
-            score -= distance * (1.8 if enemy_count else 1.0)
-            if not self.arena.walk_segment(position, point, me["stats"]["radius"], me["stats"]["height"]):
-                score -= 18
+            score -= distance * (1.55 if enemy_count else 0.90)
             if score > 19:
                 options.append((score, point))
-        return max(options, default=(0, None))[1]
+        best_score, best_point = 19, None
+        for score, point in sorted(options, reverse=True):
+            if score < best_score:
+                break
+            if not self.arena.walk_segment(position, point, me["stats"]["radius"], me["stats"]["height"]):
+                score -= 18
+            if score > best_score:
+                best_score, best_point = score, point
+        return best_point
 
     def select_target(self, obs, enemies, recover):
         me = obs["self"]
@@ -144,15 +160,19 @@ class Bot:
             distance = dist(position, target["pos"])
             if distance > 223:
                 continue
-            score = 130 - distance * 0.54
-            score += 32 * (1 - target.get("hp", 1400) / max(1, target.get("max_hp", 1400)))
+            score = 126 - distance * 0.41
+            hp = target.get("hp", 1400)
+            score += 46 * (1 - hp / max(1, target.get("max_hp", 1400)))
+            score += 26 if hp < 175 else 0
+            if target["id"] in self.recent_attackers:
+                score += 18
             if target["id"] == self.last_target:
                 score += 12
             if self.last_attack and self.last_attack[0] == target["id"] and now - self.last_attack[2] < 2:
                 score += 20
             if target.get("charging"):
                 score += 6
-            if recover and distance > 36 and target.get("hp", 500) > 110:
+            if recover and target.get("hp", 500) > 175:
                 continue
             candidates.append((score, target))
         if not recover:
@@ -163,22 +183,30 @@ class Bot:
                 target_z = target["pos"][2]
                 if target_z - position[2] > 6 and target_z - self.arena.ground(*xy(target["pos"])) > 6:
                     continue
-                score = (82 if target.get("kind") == "npc" else 74) - distance * 0.62
+                score = (99 if target.get("kind") == "npc" else 95) - distance * 0.80
+                if self.recent_attackers:
+                    score -= 40
                 score += 15 * (1 - target.get("hp", 300) / max(1, target.get("max_hp", 350)))
                 if target["id"] == self.last_target:
                     score += 11
                 candidates.append((score, target))
-        for _, target in sorted(candidates, key=lambda pair: -pair[0])[:8]:
+        ranked = sorted(candidates, key=lambda pair: -pair[0])
+        for _, target in ranked[:8]:
+            if target.get("kind") != "mech" and not self.arena.walk_segment(
+                    position, target["pos"], me["stats"]["radius"], me["stats"]["height"]):
+                continue
             if self.combat.line_of_sight(me, target):
                 return target
         # A checked ballistic trajectory can reach a tracked enemy behind cover.
         if not recover and any(w and w["kind"] == "mortar" and w["cooldown"] <= 0.1 for w in me["weapons"]):
-            for _, target in sorted(candidates, key=lambda pair: -pair[0])[:3]:
+            for _, target in ranked[:3]:
                 if target.get("kind") == "mech" and 22 < dist(position, target["pos"]) < 125:
                     return target
         return None
 
     def act(self, obs):
+        # Leave time for serialization and transport after tactical searches.
+        deadline = perf_counter() + 0.030
         me, now, zone = obs["self"], obs["t"], obs["zone"]
         position = me["pos"]
         if self.spawn is None:
@@ -187,17 +215,19 @@ class Bot:
         enemies = sorted((e for e in obs["mechs"] if e["kind"] == "mech"),
                          key=lambda e: dist(xy(position), xy(e["pos"])))
         self.observe_combat(obs, enemies)
-        nearby = [e for e in enemies if dist(xy(position), xy(e["pos"])) < 115]
+        nearby = [e for e in enemies if dist(xy(position), xy(e["pos"])) < 155]
         close = bool(nearby and dist(xy(position), xy(nearby[0]["pos"])) < 65)
+        threats = sorted(nearby, key=lambda e: e["id"] not in self.recent_attackers)
         ratio = me["hp"] / me["max_hp"]
-        if ratio < 0.48 or (ratio < 0.72 and len(nearby) >= 3):
+        outnumbered = len(self.recent_attackers) >= 2
+        if ratio < 0.46 or (ratio < 0.78 and outnumbered):
             self.recovering = True
-        elif ratio > 0.84:
+        elif ratio > 0.80:
             self.recovering = False
         cautious = self.free_for_all and obs["alive"] >= 6
         recover = self.recovering or (cautious and close)
         target = self.select_target(obs, enemies, recover)
-        pressure = bool(nearby and (len(nearby) >= 2 or
+        pressure = bool(nearby and (outnumbered or
                         dist(xy(position), xy(nearby[0]["pos"])) < 38))
         goal, urgent = self.pilot.zone_goal(obs)
         rotating = goal is not None
@@ -220,17 +250,19 @@ class Bot:
             drop = self.supply_goal(obs, nearby)
             if drop is not None and not (cautious and close):
                 goal = drop
-            elif recover and nearby:
-                goal = self.pilot.cover(obs, nearby) or goal
+            elif recover and threats:
+                goal = self.pilot.cover(obs, threats, deadline - 0.010) or goal
             elif target is None or target.get("kind") != "mech" or not pressure:
-                loot = self.loot_goal(obs, len(nearby))
+                loot = self.loot_goal(obs, len(self.recent_attackers))
                 if loot is not None:
                     goal = loot
+                elif target and target.get("kind") != "mech" and dist(position, target["pos"]) > 24:
+                    goal = target["pos"]
             if goal is None and target is None and not nearby:
                 center = zone["next_center"]
                 distance = dist(xy(position), center)
                 # Head toward playable ground while scanning for early resources.
-                hold_at = max(18, min(zone["next_radius"] * 0.75, 145))
+                hold_at = max(18, zone["next_radius"] * 0.82)
                 if distance > hold_at and not cautious and not (self.recovering and now - self.last_damage < 8):
                     goal = center
             if goal is None and target is None and nearby and not recover and not cautious:
@@ -239,8 +271,8 @@ class Bot:
                     goal = nearest["pos"]
 
         quiet = cautious and not rotating
-        move, boost, jump = self.pilot.move(obs, goal, urgent, nearby, target, recover, quiet)
-        aim, fire = self.combat.act(me, target, pressure)
+        aim, fire = self.combat.act(me, target, pressure, now)
+        move, boost, jump = self.pilot.move(obs, goal, urgent, threats, target, recover, quiet, deadline)
         if aim is None and cautious and recover:
             fire = [False, False]
         if aim is None:
@@ -248,7 +280,7 @@ class Bot:
         action.update(move=move, boost=boost, jump=jump, aim=aim, fire=fire)
         if any(w and w["kind"] == "gun" and not w["reload"] and w["ammo"] < w["stats"]["mag"] * 0.72
                for w in me["weapons"]):
-            if target is None or (target.get("kind") != "mech" and me["weapons"][0]["ammo"] <= 2):
+            if target is None:
                 action["reload"] = True
         self.last_target = target["id"] if target else None
         return action
