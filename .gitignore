@@ -1,0 +1,5 @@
+__pycache__/
+.DS_Store
+.gastown-local/
+mechfight-kit/
+mechfight-kit.tar.gz
